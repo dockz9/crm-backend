@@ -211,5 +211,44 @@ app.get("/dashboard/stats", async (req, res) => {
   }
 });
 
+app.get("/companies", async (req, res) => {
+  try {
+    const companyMap = {};
+    let pageToken = null;
+
+    while (true) {
+      const data = await firestoreList("contacts", 300, pageToken);
+      if (!data.documents) break;
+
+      for (const doc of data.documents) {
+        const c = parseDoc(doc);
+        const co = c.company?.trim();
+        if (!co) continue;
+        if (!companyMap[co]) companyMap[co] = { name: co, contacts: [] };
+        const hasName = c.firstName || c.lastName || (c.name && c.name !== co);
+        if (hasName) companyMap[co].contacts.push({
+          id: c.id,
+          name: c.name || `${c.firstName || ""} ${c.lastName || ""}`.trim(),
+          jobTitle: c.jobTitle || "",
+          email: c.email || "",
+          phone: c.phone || "",
+        });
+      }
+
+      if (!data.nextPageToken) break;
+      pageToken = data.nextPageToken;
+      await new Promise(r => setTimeout(r, 30));
+    }
+
+    const companies = Object.values(companyMap)
+      .filter(co => co.contacts.length > 0)
+      .sort((a, b) => a.name.localeCompare(b.name));
+
+    res.json({ companies, total: companies.length });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => console.log(`CRM backend running on port ${PORT}`));
