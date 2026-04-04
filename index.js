@@ -7,72 +7,209 @@ app.use(express.json());
 
 const PROJECT_ID = process.env.FIREBASE_PROJECT_ID;
 const API_KEY = process.env.FIREBASE_API_KEY;
-const FIREBASE_URL = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents`;
-
-app.get("/", (req, res) => {
-  res.json({ status: "Win This Moment! CRM backend is running" });
-});
+const BASE = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents`;
 
 function parseDoc(doc) {
   const id = doc.name.split("/").pop();
   const fields = doc.fields || {};
   const parsed = {};
   for (const [k, v] of Object.entries(fields)) {
-    parsed[k] = v.stringValue ?? v.integerValue ?? v.booleanValue ?? v.arrayValue ?? null;
+    if (v.stringValue !== undefined) parsed[k] = v.stringValue;
+    else if (v.integerValue !== undefined) parsed[k] = v.integerValue;
+    else if (v.doubleValue !== undefined) parsed[k] = v.doubleValue;
+    else if (v.booleanValue !== undefined) parsed[k] = v.booleanValue;
+    else if (v.arrayValue !== undefined) parsed[k] = (v.arrayValue.values || []).map(x => x.stringValue || "");
+    else parsed[k] = null;
   }
   return { id, ...parsed };
 }
 
-async function fetchAllContacts() {
-  let allDocs = [];
+async function firestoreList(col, pageSize = 50, pageToken = null) {
+  let url = `${BASE}/${col}?pageSize=${pageSize}&key=${API_KEY}`;
+  if (pageToken) url += `&pageToken=${pageToken}`;
+  const res = await fetch(url);
+  return res.json();
+}
+
+async function fetchAll(col) {
+  let all = [];
   let pageToken = null;
-
   while (true) {
-    const url = `${FIREBASE_URL}/contacts?pageSize=300&key=${API_KEY}${pageToken ? `&pageToken=${pageToken}` : ""}`;
-    const response = await fetch(url);
-    const data = await response.json();
-
-    if (data.documents) {
-      allDocs = allDocs.concat(data.documents.map(parseDoc));
-    }
-
+    const data = await firestoreList(col, 300, pageToken);
+    if (data.documents) all = all.concat(data.documents.map(parseDoc));
     if (!data.nextPageToken) break;
     pageToken = data.nextPageToken;
+    await new Promise(r => setTimeout(r, 50));
   }
-
-  return allDocs;
+  return all;
 }
+
+app.get("/", (req, res) => {
+  res.json({ status: "Win This Moment! CRM backend is running", version: "2.0" });
+});
+
+app.get("/contacts", async (req, res) => {
+  try {
+    const { pageToken, limit = 50 } = req.query;
+    const data = await firestoreList("contacts", Number(limit), pageToken || null);
+    const contacts = (data.documents || []).map(parseDoc)
+      .filter(c => c.firstName || c.lastName || (c.name && c.name !== c.company));
+    res.json({ contacts, nextPageToken: data.nextPageToken || null });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
 app.get("/contacts/search", async (req, res) => {
   try {
-    const { q, limit = 50 } = req.query;
+    const { q, limit = 100 } = req.query;
 
     if (!q || q.trim().length < 2) {
-      // No search — just return first page
-      const url = `${FIREBASE_URL}/contacts?pageSize=${limit}&key=${API_KEY}`;
-      const response = await fetch(url);
-      const data = await response.json();
-      const contacts = (data.documents || []).map(parseDoc);
+      const data = await firestoreList("contacts", Number(limit));
+      const contacts = (data.documents || []).map(parseDoc)
+        .filter(c => c.firstName || c.lastName || (c.name && c.name !== c.company));
       return res.json({ contacts, total: contacts.length });
     }
 
-    // Search — fetch all and filter
-    const all = await fetchAllContacts();
     const query = q.toLowerCase();
-    const filtered = all.filter(c =>
-      c.firstName?.toLowerCase().includes(query) ||
-      c.lastName?.toLowerCase().includes(query) ||
-      c.name?.toLowerCase().includes(query) ||
-      c.email?.toLowerCase().includes(query) ||
-      c.company?.toLowerCase().includes(query) ||
-      c.jobTitle?.toLowerCase().includes(query)
-    );
+    const matched = [];
+    let pageToken = null;
 
-    res.json({ contacts: filtered.slice(0, Number(limit)), total: filtered.length });
+    while (true) {
+      const data = await firestoreList("contacts", 300, pageToken);
+      if (!data.documents) break;
+      for (const doc of data.documents) {
+        const c = parseDoc(doc);
+        if (!c.firstName && !c.lastName && (!c.name || c.name === c.company)) continue;
+        if (
+          c.firstName?.toLowerCase().includes(query) ||
+          c.lastName?.toLowerCase().includes(query) ||
+          c.name?.toLowerCase().includes(query) ||
+          c.email?.toLowerCase().includes(query) ||
+          c.company?.toLowerCase().includes(query) ||
+          c.jobTitle?.toLowerCase().includes(query) ||
+          c.metroArea?.toLowerCase().includes(query) ||
+          c.industry?.toLowerCase().includes(query) ||
+          c.importGroups?.toLowerCase().includes(query)
+        ) {
+          matched.push(c);
+        }
+      }
+      if (!data.nextPageToken) break;
+      pageToken = data.nextPageToken;
+      await new Promise(r => setTimeout(r, 30));
+    }
+
+    matched.sort((a, b) => (a.lastName || a.name || "").toLowerCase().localeCompare((b.lastName || b.name || "").toLowerCase()));
+    res.json({ contacts: matched.slice(0, Number(limit)), total: matched.length });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/contacts/ai-search", async (req, res) => {
+  try {
+    const { prompt } = req.body;
+    if (!prompt) return res.status(400).json({ error: "prompt required" });
+
+    const sample = [];
+    let pageToken = null;
+    let loaded = 0;
+
+    while (loaded < 5000) {
+      const data = await firestoreList("contacts", 300, pageToken);
+      if (!data.documents) break;
+      for (const doc of data.documents) {
+        const c = parseDoc(doc);
+        if (!c.firstName && !c.lastName && (!c.name || c.name === c.company)) continue;
+        sample.push({
+          id: c.id,
+          name: c.name || `${c.firstName || ""} ${c.lastName || ""}`.trim(),
+          company: c.company || "",
+          jobTitle: c.jobTitle || "",
+          metroArea: c.metroArea || "",
+          industry: c.industry || "",
+          importGroups: c.importGroups || "",
+          email: c.email || "",
+          status: c.status || "",
+        });
+        loaded++;
+      }
+      if (!data.nextPageToken) break;
+      pageToken = data.nextPageToken;
+      await new Promise(r => setTimeout(r, 30));
+    }
+
+    const claudeRes = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 2000,
+        messages: [{
+          role: "user",
+          content: `You are a CRM assistant. Based on this request: "${prompt}"
+          
+Find the best matching contacts. Return ONLY a JSON array of contact IDs, max 50.
+Format: ["id1", "id2", ...]
+
+Contacts:
+${JSON.stringify(sample)}
+
+Return ONLY the JSON array.`
+        }]
+      })
+    });
+
+    const claudeData = await claudeRes.json();
+    const text = claudeData.content?.[0]?.text || "[]";
+    const ids = JSON.parse(text.replace(/```json|```/g, "").trim());
+    const results = sample.filter(c => ids.includes(c.id));
+    res.json({ contacts: results, total: results.length, prompt });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get("/dashboard/stats", async (req, res) => {
+  try {
+    const [emails, tasks, meetings] = await Promise.all([
+      fetchAll("emails"),
+      fetchAll("tasks"),
+      fetchAll("meetings"),
+    ]);
+
+    const now = Date.now();
+    const DAY = 86400000;
+    const sentEmails = emails.filter(e => e.direction === "sent");
+    const followUps = [];
+    const seen = new Set();
+
+    for (const sent of sentEmails) {
+      const daysSince = Math.floor((now - new Date(sent.date).getTime()) / DAY);
+      if (daysSince < 22) continue;
+      const replied = emails.some(e =>
+        e.contactId === sent.contactId &&
+        e.direction === "received" &&
+        new Date(e.date) > new Date(sent.date)
+      );
+      if (replied || seen.has(sent.contactId)) continue;
+      seen.add(sent.contactId);
+      followUps.push({ contactId: sent.contactId, subject: sent.subject, daysSince, emailId: sent.id });
+    }
+
+    res.json({
+      totalEmails: emails.length,
+      totalTasks: tasks.length,
+      pendingTasks: tasks.filter(t => t.status === "pending").length,
+      totalMeetings: meetings.length,
+      upcomingMeetings: meetings.filter(m => m.status === "upcoming").length,
+      followUps: followUps.slice(0, 20),
+    });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`CRM backend running on port ${PORT}`));
