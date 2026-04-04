@@ -250,5 +250,31 @@ app.get("/companies", async (req, res) => {
   }
 });
 
+app.get("/groups", async (req, res) => {
+  try {
+    const grpMap = {};
+    let pageToken = null;
+    while (true) {
+      const data = await firestoreList("contacts", 300, pageToken);
+      if (!data.documents) break;
+      for (const doc of data.documents) {
+        const c = parseDoc(doc);
+        const gRaw = c.importGroups?.trim();
+        if (!gRaw) continue;
+        gRaw.split(",").map(g => g.trim()).filter(Boolean).forEach(g => {
+          if (!grpMap[g]) grpMap[g] = [];
+          grpMap[g].push({ id: c.id, name: c.name || `${c.firstName || ""} ${c.lastName || ""}`.trim() });
+        });
+      }
+      if (!data.nextPageToken) break;
+      pageToken = data.nextPageToken;
+      await new Promise(r => setTimeout(r, 30));
+    }
+    res.json({ groups: grpMap });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => console.log(`CRM backend running on port ${PORT}`));
