@@ -60,16 +60,17 @@ app.get("/contacts", async (req, res) => {
   }
 });
 
-app.get("/contacts/search", async (req, res) => {
+app.get("/contacts", async (req, res) => {
   try {
-    const { q, limit = 100 } = req.query;
-
-    if (!q || q.trim().length < 2) {
-      const data = await firestoreList("contacts", Number(limit));
-      const contacts = (data.documents || []).map(parseDoc)
-        .filter(c => c.firstName || c.lastName || (c.name && c.name !== c.company));
-      return res.json({ contacts, total: contacts.length });
-    }
+    const { pageToken, limit = 50 } = req.query;
+    const data = await firestoreList("contacts", Number(limit), pageToken || null);
+    const contacts = (data.documents || []).map(parseDoc)
+      .filter(c => c.firstName || c.lastName || (c.name && c.name !== c.company));
+    res.json({ contacts, nextPageToken: data.nextPageToken || null });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
     const query = q.toLowerCase();
     const matched = [];
@@ -265,8 +266,14 @@ let groupsCacheTime = 0;
 
 app.get("/groups", async (req, res) => {
   try {
+    const now = Date.now();
+    if (groupsCache && (now - groupsCacheTime) < CACHE_TTL) {
+      return res.json({ groups: groupsCache, cached: true });
+    }
+
     const grpMap = {};
     let pageToken = null;
+
     while (true) {
       const data = await firestoreList("contacts", 300, pageToken);
       if (!data.documents) break;
@@ -276,22 +283,26 @@ app.get("/groups", async (req, res) => {
         if (!gRaw) continue;
         gRaw.split(",").map(g => g.trim()).filter(Boolean).forEach(g => {
           if (!grpMap[g]) grpMap[g] = [];
-          grpMap[g].push({ id: c.id, name: c.name || `${c.firstName || ""} ${c.lastName || ""}`.trim() });
+          grpMap[g].push({
+            id: c.id,
+            name: c.name || `${c.firstName || ""} ${c.lastName || ""}`.trim(),
+            company: c.company || "",
+            email: c.email || "",
+            jobTitle: c.jobTitle || "",
+          });
         });
       }
       if (!data.nextPageToken) break;
       pageToken = data.nextPageToken;
       await new Promise(r => setTimeout(r, 30));
     }
+
+    groupsCache = grpMap;
+    groupsCacheTime = now;
+
     res.json({ groups: grpMap });
   } catch (e) {
     res.status(500).json({ error: e.message });
-
-    if (groupsCache && (Date.now() - groupsCacheTime) < CACHE_TTL) {
-  return res.json({ groups: groupsCache, cached: true });
-}
-    groupsCache = grpMap;
-groupsCacheTime = Date.now();
   }
 });
 
