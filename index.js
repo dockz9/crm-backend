@@ -211,15 +211,23 @@ app.get("/dashboard/stats", async (req, res) => {
   }
 });
 
+let companiesCache = null;
+let companiesCacheTime = 0;
+const CACHE_TTL = 10 * 60 * 1000;
+
 app.get("/companies", async (req, res) => {
   try {
+    const now = Date.now();
+    if (companiesCache && (now - companiesCacheTime) < CACHE_TTL) {
+      return res.json({ companies: companiesCache, total: companiesCache.length, cached: true });
+    }
+
     const companyMap = {};
     let pageToken = null;
 
     while (true) {
       const data = await firestoreList("contacts", 300, pageToken);
       if (!data.documents) break;
-
       for (const doc of data.documents) {
         const c = parseDoc(doc);
         const co = c.company?.trim();
@@ -234,7 +242,6 @@ app.get("/companies", async (req, res) => {
           phone: c.phone || "",
         });
       }
-
       if (!data.nextPageToken) break;
       pageToken = data.nextPageToken;
       await new Promise(r => setTimeout(r, 30));
@@ -243,6 +250,9 @@ app.get("/companies", async (req, res) => {
     const companies = Object.values(companyMap)
       .filter(co => co.contacts.length > 0)
       .sort((a, b) => a.name.localeCompare(b.name));
+
+    companiesCache = companies;
+    companiesCacheTime = now;
 
     res.json({ companies, total: companies.length });
   } catch (e) {
