@@ -52,8 +52,13 @@ app.get("/contacts", async (req, res) => {
   try {
     const { pageToken, limit = 50 } = req.query;
     const data = await firestoreList("contacts", Number(limit), pageToken || null);
+    app.get("/contacts", async (req, res) => {
+  try {
+    const { pageToken, limit = 50 } = req.query;
+    const data = await firestoreList("contacts", Number(limit), pageToken || null);
     const contacts = (data.documents || []).map(parseDoc)
-      .filter(c => c.firstName || c.lastName || (c.name && c.name !== c.company));
+      .filter(c => c.firstName || c.lastName || (c.name && c.name !== c.company))
+      .sort((a, b) => (a.lastName || a.name || "").toLowerCase().localeCompare((b.lastName || b.name || "").toLowerCase()));
     res.json({ contacts, nextPageToken: data.nextPageToken || null });
   } catch (e) {
     res.status(500).json({ error: e.message });
