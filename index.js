@@ -260,6 +260,9 @@ app.get("/companies", async (req, res) => {
   }
 });
 
+let groupsCache = null;
+let groupsCacheTime = 0;
+
 app.get("/groups", async (req, res) => {
   try {
     const grpMap = {};
@@ -283,6 +286,12 @@ app.get("/groups", async (req, res) => {
     res.json({ groups: grpMap });
   } catch (e) {
     res.status(500).json({ error: e.message });
+
+    if (groupsCache && (Date.now() - groupsCacheTime) < CACHE_TTL) {
+  return res.json({ groups: groupsCache, cached: true });
+}
+    groupsCache = grpMap;
+groupsCacheTime = Date.now();
   }
 });
 
