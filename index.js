@@ -306,5 +306,94 @@ app.post("/cache/refresh", (req, res) => {
   res.json({ message: "Cache refresh started" });
 });
 
+app.post("/gmail/sync", async (req, res) => {
+  try {
+    const { token, accountEmail } = req.body;
+    if (!token) return res.status(400).json({ error: "token required" });
+
+    const contactEmails = {};
+    cache.contacts.forEach(c => {
+      if (c.email) contactEmails[c.email.toLowerCase()] = c.id;
+    });
+
+    let synced = 0;
+    const results = [];
+
+    for (const folder of ["", "in:sent"]) {
+      const emailList = cache.contacts
+        .filter(c => c.email)
+        .slice(0, 100)
+        .map(c => `from:${c.email} OR to:${c.email}`)
+        .join(" OR ");
+
+      const q = folder ? `${folder} ${emailList}` : emailList;
+      const listRes = await fetch(
+        `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${encodeURIComponent(q)}&maxResults=100`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+
+      if (listRes.status === 401) {
+        return res.status(401).json({ error: "Gmail token expired" });
+      }
+
+      const listData = await listRes.json();
+      const messages = listData.messages || [];
+
+      for (const msg of messages) {
+        const detailRes = await fetch(
+          `https://gmail.googleapis.com/gmail/v1/users/me/messages/${msg.id}?format=metadata&metadataHeaders=From&metadataHeaders=To&metadataHeaders=Subject&metadataHeaders=Date`,
+          { headers: { Authorization: `Bearer ${token}` } }
+        );
+        const detail = await detailRes.json();
+        const headers = detail.payload?.headers || [];
+        const from = headers.find(h => h.name === "From")?.value || "";
+        const to = headers.find(h => h.name === "To")?.value || "";
+        const subject = headers.find(h => h.name === "Subject")?.value || "(no subject)";
+        const date = headers.find(h => h.name === "Date")?.value || "";
+
+        const fromEmail = from.match(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/)?.[0]?.toLowerCase();
+        const toEmail = to.match(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/)?.[0]?.toLowerCase();
+
+        const contactId = contactEmails[fromEmail] || contactEmails[toEmail];
+        if (!contactId) continue;
+
+        const direction = contactEmails[fromEmail] ? "received" : "sent";
+        const dateStr = date ? new Date(date).toISOString().slice(0, 10) : new Date().toISOString().slice(0, 10);
+
+        results.push({
+          gmailId: msg.id,
+          contactId,
+          subject,
+          body: "",
+          date: dateStr,
+          direction,
+          status: "read",
+          autoSynced: true,
+          gmailAccount: accountEmail || "",
+        });
+        synced++;
+      }
+    }
+
+    // Save to Firebase in batches
+    const BASE_FS = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents`;
+    for (const email of results) {
+      await fetch(`${BASE_FS}/emails?key=${API_KEY}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          fields: Object.fromEntries(
+            Object.entries(email).map(([k, v]) => [k, { stringValue: String(v) }])
+          )
+        })
+      });
+    }
+
+    res.json({ synced, total: results.length });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => console.log(`CRM backend v3.0 running on port ${PORT}`));
