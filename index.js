@@ -395,5 +395,154 @@ app.post("/gmail/sync", async (req, res) => {
   }
 });
 
+app.post("/ai/pitchdeck-match", async (req, res) => {
+  try {
+    const { deckText, deckName } = req.body;
+    if (!deckText) return res.status(400).json({ error: "deckText required" });
+
+    // Step 1: Extract deal details from deck
+    const extractRes = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 1000,
+        messages: [{
+          role: "user",
+          content: `Extract the key investment details from this pitch deck. Return ONLY a JSON object with these fields:
+{
+  "companyName": "",
+  "assetClass": "",
+  "strategy": "",
+  "geography": "",
+  "dealSize": "",
+  "returnTarget": "",
+  "sector": "",
+  "summary": ""
+}
+
+Pitch deck content:
+${deckText.slice(0, 8000)}
+
+Return ONLY the JSON object.`
+        }]
+      })
+    });
+    const extractData = await extractRes.json();
+    const extractText = extractData.content?.[0]?.text || "{}";
+    let dealDetails = {};
+    try { dealDetails = JSON.parse(extractText.replace(/```json|```/g, "").trim()); } catch {}
+
+    // Step 2: Match against CRM contacts
+    const contactSample = cache.contacts.slice(0, 8000).map(c => ({
+      id: c.id,
+      name: c.name || `${c.firstName || ""} ${c.lastName || ""}`.trim(),
+      company: c.company || "",
+      jobTitle: c.jobTitle || "",
+      industry: c.industry || "",
+      importGroups: c.importGroups || "",
+      metroArea: c.metroArea || "",
+      email: c.email || "",
+    }));
+
+    const matchRes = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 3000,
+        messages: [{
+          role: "user",
+          content: `You are a capital markets expert. Based on this deal, find the best matching investors from the CRM database.
+
+Deal details:
+${JSON.stringify(dealDetails)}
+
+Find the top 30 best matching contacts. For each match explain WHY they are a good fit.
+
+Return ONLY a JSON array:
+[{
+  "id": "contact_id",
+  "name": "contact name",
+  "company": "company",
+  "reason": "why they match",
+  "score": 95,
+  "group": "PE Investor" 
+}]
+
+Groups should be one of: PE Investor, Family Office, Pension Fund, Endowment, Sovereign Wealth, Fund of Funds, Real Estate, Infrastructure, Credit, Other
+
+CRM contacts (${contactSample.length} total):
+${JSON.stringify(contactSample)}
+
+Return ONLY the JSON array.`
+        }]
+      })
+    });
+    const matchData = await matchRes.json();
+    const matchText = matchData.content?.[0]?.text || "[]";
+    let matches = [];
+    try { matches = JSON.parse(matchText.replace(/```json|```/g, "").trim()); } catch {}
+
+    // Step 3: Web search for additional investors not in CRM
+    const webRes = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 1000,
+        tools: [{ type: "web_search_20250305", name: "web_search" }],
+        messages: [{
+          role: "user",
+          content: `Search for institutional investors who typically invest in: ${dealDetails.assetClass} ${dealDetails.strategy} ${dealDetails.sector} deals of size ${dealDetails.dealSize}. 
+          
+Find 5-10 specific investors/funds NOT already in a private CRM who would be good targets for this deal. Return ONLY a JSON array:
+[{
+  "name": "investor name",
+  "company": "firm",
+  "reason": "why they match",
+  "score": 75,
+  "group": "investor type",
+  "inCRM": false
+}]`
+        }]
+      })
+    });
+    const webData = await webRes.json();
+    const webText = (webData.content || []).filter(b => b.type === "text").map(b => b.text).join("");
+    let webMatches = [];
+    try {
+      const jsonMatch = webText.match(/\[[\s\S]*\]/);
+      if (jsonMatch) webMatches = JSON.parse(jsonMatch[0]);
+    } catch {}
+    webMatches = webMatches.map(m => ({ ...m, inCRM: false }));
+
+    // Combine and sort
+    const allMatches = [
+      ...matches.map(m => ({ ...m, inCRM: true })),
+      ...webMatches
+    ].sort((a, b) => (b.score || 0) - (a.score || 0));
+
+    // Group results
+    const grouped = {};
+    allMatches.forEach(m => {
+      const g = m.group || "Other";
+      if (!grouped[g]) grouped[g] = [];
+      grouped[g].push(m);
+    });
+
+    res.json({
+      dealDetails,
+      matches: allMatches,
+      grouped,
+      totalCRM: matches.length,
+      totalWeb: webMatches.length,
+      deckName: deckName || "Uploaded Deck",
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => console.log(`CRM backend v3.0 running on port ${PORT}`));
