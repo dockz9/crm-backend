@@ -452,10 +452,14 @@ ${(deckText || "").slice(0, 8000)}`;
       })
     });
     const extractData = await extractRes.json();
+    console.log("Extract response:", JSON.stringify(extractData).slice(0, 300));
     const extractText = extractData.content?.[0]?.text || "{}";
     let dealDetails = {};
-    try { dealDetails = JSON.parse(extractText.replace(/```json|```/g, "").trim()); } catch {}
-
+try {
+  const cleaned = extractText.replace(/```json|```/g, "").trim();
+  const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
+  if (jsonMatch) dealDetails = JSON.parse(jsonMatch[0]);
+} catch(e) { console.error("Extract parse error:", e.message, extractText.slice(0, 200)); }
     // Step 2: Match against CRM contacts
     const contactSample = cache.contacts.slice(0, 8000).map(c => ({
       id: c.id,
@@ -502,8 +506,11 @@ Return ONLY the JSON array.`
     const matchData = await matchRes.json();
     const matchText = matchData.content?.[0]?.text || "[]";
     let matches = [];
-    try { matches = JSON.parse(matchText.replace(/```json|```/g, "").trim()); } catch {}
-
+try {
+  const cleaned = matchText.replace(/```json|```/g, "").trim();
+  const jsonMatch = cleaned.match(/\[[\s\S]*\]/);
+  if (jsonMatch) matches = JSON.parse(jsonMatch[0]);
+} catch(e) { console.error("Match parse error:", e.message, matchText.slice(0, 200)); }
     // Step 3: Web search for additional investors
     const webRes = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
