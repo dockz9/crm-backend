@@ -397,19 +397,34 @@ app.post("/gmail/sync", async (req, res) => {
 
 app.post("/ai/pitchdeck-match", async (req, res) => {
   try {
-    const { deckText, deckName } = req.body;
-    if (!deckText) return res.status(400).json({ error: "deckText required" });
+    const { deckText, deckName, base64, fileType } = req.body;
+    if (!deckText && !base64) return res.status(400).json({ error: "deckText or base64 required" });
 
-    // Step 1: Extract deal details from deck
-    const extractRes = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: "claude-sonnet-4-20250514",
-        max_tokens: 1000,
-        messages: [{
-          role: "user",
-          content: `Extract the key investment details from this pitch deck. Return ONLY a JSON object with these fields:
+    // Build message content — use document API for PDFs, text for others
+    let extractContent;
+    if (base64 && fileType === "pdf") {
+      extractContent = [
+        {
+          type: "document",
+          source: { type: "base64", media_type: "application/pdf", data: base64 }
+        },
+        {
+          type: "text",
+          text: `Extract the key investment details from this pitch deck. Return ONLY a JSON object:
+{
+  "companyName": "",
+  "assetClass": "",
+  "strategy": "",
+  "geography": "",
+  "dealSize": "",
+  "returnTarget": "",
+  "sector": "",
+  "summary": ""
+}`
+        }
+      ];
+    } else {
+      extractContent = `Extract the key investment details from this pitch deck. Return ONLY a JSON object:
 {
   "companyName": "",
   "assetClass": "",
@@ -422,10 +437,17 @@ app.post("/ai/pitchdeck-match", async (req, res) => {
 }
 
 Pitch deck content:
-${deckText.slice(0, 8000)}
+${(deckText || "").slice(0, 8000)}`;
+    }
 
-Return ONLY the JSON object.`
-        }]
+    // Step 1: Extract deal details
+    const extractRes = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 1000,
+        messages: [{ role: "user", content: extractContent }]
       })
     });
     const extractData = await extractRes.json();
@@ -453,26 +475,23 @@ Return ONLY the JSON object.`
         max_tokens: 3000,
         messages: [{
           role: "user",
-          content: `You are a capital markets expert. Based on this deal, find the best matching investors from the CRM database.
+          content: `You are a capital markets expert. Based on this deal, find the best matching investors from the CRM.
 
-Deal details:
-${JSON.stringify(dealDetails)}
+Deal: ${JSON.stringify(dealDetails)}
 
-Find the top 30 best matching contacts. For each match explain WHY they are a good fit.
-
-Return ONLY a JSON array:
+Find the top 30 best matching contacts. Return ONLY a JSON array:
 [{
   "id": "contact_id",
-  "name": "contact name",
+  "name": "name",
   "company": "company",
   "reason": "why they match",
   "score": 95,
-  "group": "PE Investor" 
+  "group": "PE Investor"
 }]
 
-Groups should be one of: PE Investor, Family Office, Pension Fund, Endowment, Sovereign Wealth, Fund of Funds, Real Estate, Infrastructure, Credit, Other
+Groups: PE Investor, Family Office, Pension Fund, Endowment, Sovereign Wealth, Fund of Funds, Real Estate, Infrastructure, Credit, Other
 
-CRM contacts (${contactSample.length} total):
+CRM contacts (${contactSample.length}):
 ${JSON.stringify(contactSample)}
 
 Return ONLY the JSON array.`
@@ -484,7 +503,7 @@ Return ONLY the JSON array.`
     let matches = [];
     try { matches = JSON.parse(matchText.replace(/```json|```/g, "").trim()); } catch {}
 
-    // Step 3: Web search for additional investors not in CRM
+    // Step 3: Web search for additional investors
     const webRes = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -494,11 +513,11 @@ Return ONLY the JSON array.`
         tools: [{ type: "web_search_20250305", name: "web_search" }],
         messages: [{
           role: "user",
-          content: `Search for institutional investors who typically invest in: ${dealDetails.assetClass} ${dealDetails.strategy} ${dealDetails.sector} deals of size ${dealDetails.dealSize}. 
-          
-Find 5-10 specific investors/funds NOT already in a private CRM who would be good targets for this deal. Return ONLY a JSON array:
+          content: `Search for institutional investors who invest in ${dealDetails.assetClass} ${dealDetails.strategy} ${dealDetails.sector} deals of size ${dealDetails.dealSize} in ${dealDetails.geography}.
+
+Return ONLY a JSON array of 5-10 investors not already in a private CRM:
 [{
-  "name": "investor name",
+  "name": "person name",
   "company": "firm",
   "reason": "why they match",
   "score": 75,
@@ -517,13 +536,11 @@ Find 5-10 specific investors/funds NOT already in a private CRM who would be goo
     } catch {}
     webMatches = webMatches.map(m => ({ ...m, inCRM: false }));
 
-    // Combine and sort
     const allMatches = [
       ...matches.map(m => ({ ...m, inCRM: true })),
       ...webMatches
     ].sort((a, b) => (b.score || 0) - (a.score || 0));
 
-    // Group results
     const grouped = {};
     allMatches.forEach(m => {
       const g = m.group || "Other";
