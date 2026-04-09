@@ -49,6 +49,17 @@ function isPersonContact(c) {
   return !!(c.firstName || c.lastName || (c.name && c.name !== c.company));
 }
 
+async function callClaude(messages, maxTokens = 2000, tools = null) {
+  const body = { model: "claude-sonnet-4-20250514", max_tokens: maxTokens, messages };
+  if (tools) body.tools = tools;
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  });
+  return res.json();
+}
+
 const CACHE_REFRESH_MS = 30 * 60 * 1000;
 
 let cache = {
@@ -140,7 +151,7 @@ setInterval(buildCache, CACHE_REFRESH_MS);
 app.get("/", (req, res) => {
   res.json({
     status: "Win This Moment! CRM backend is running",
-    version: "3.0",
+    version: "3.1",
     cache: {
       contacts: cache.contacts.length,
       companies: cache.companies.length,
@@ -213,19 +224,14 @@ app.post("/contacts/ai-search", async (req, res) => {
       status: c.status || "",
     }));
 
-    const claudeRes = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: "claude-sonnet-4-20250514",
-        max_tokens: 2000,
-        messages: [{ role: "user", content: `You are a CRM assistant. Based on this request: "${prompt}"\n\nFind the best matching contacts. Return ONLY a JSON array of contact IDs, max 50.\nFormat: ["id1", "id2", ...]\n\nContacts:\n${JSON.stringify(sample)}\n\nReturn ONLY the JSON array.` }]
-      })
-    });
+    const data = await callClaude([{
+      role: "user",
+      content: `You are a CRM assistant. Based on this request: "${prompt}"\n\nFind the best matching contacts. Return ONLY a JSON array of contact IDs, max 50.\nFormat: ["id1", "id2", ...]\n\nContacts:\n${JSON.stringify(sample)}\n\nReturn ONLY the JSON array.`
+    }]);
 
-    const claudeData = await claudeRes.json();
-    const text = claudeData.content?.[0]?.text || "[]";
-    const ids = JSON.parse(text.replace(/```json|```/g, "").trim());
+    const text = data.content?.[0]?.text || "[]";
+    let ids = [];
+    try { ids = JSON.parse(text.replace(/```json|```/g, "").trim()); } catch {}
     res.json({ contacts: cache.contacts.filter(c => ids.includes(c.id)), total: ids.length, prompt });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -302,45 +308,30 @@ app.get("/dashboard/stats", async (req, res) => {
   }
 });
 
-app.post("/cache/refresh", (req, res) => {
-  buildCache();
-  res.json({ message: "Cache refresh started" });
-});
-
 app.post("/gmail/sync", async (req, res) => {
   try {
     const { token, accountEmail } = req.body;
     if (!token) return res.status(400).json({ error: "token required" });
 
-    const contactEmails = {};
+    const contactEmailMap = {};
     cache.contacts.forEach(c => {
-      if (c.email) contactEmails[c.email.toLowerCase()] = c.id;
+      if (c.email) contactEmailMap[c.email.toLowerCase()] = c.id;
     });
 
-    let synced = 0;
     const results = [];
+    const contactEmails = cache.contacts.filter(c => c.email).slice(0, 100);
+    const emailQuery = contactEmails.map(c => `from:${c.email} OR to:${c.email}`).join(" OR ");
 
     for (const folder of ["", "in:sent"]) {
-      const emailList = cache.contacts
-        .filter(c => c.email)
-        .slice(0, 100)
-        .map(c => `from:${c.email} OR to:${c.email}`)
-        .join(" OR ");
-
-      const q = folder ? `${folder} ${emailList}` : emailList;
+      const q = folder ? `${folder} ${emailQuery}` : emailQuery;
       const listRes = await fetch(
         `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${encodeURIComponent(q)}&maxResults=100`,
         { headers: { Authorization: `Bearer ${token}` } }
       );
-
-      if (listRes.status === 401) {
-        return res.status(401).json({ error: "Gmail token expired" });
-      }
-
+      if (listRes.status === 401) return res.status(401).json({ error: "Gmail token expired" });
       const listData = await listRes.json();
-      const messages = listData.messages || [];
 
-      for (const msg of messages) {
+      for (const msg of (listData.messages || [])) {
         const detailRes = await fetch(
           `https://gmail.googleapis.com/gmail/v1/users/me/messages/${msg.id}?format=metadata&metadataHeaders=From&metadataHeaders=To&metadataHeaders=Subject&metadataHeaders=Date`,
           { headers: { Authorization: `Bearer ${token}` } }
@@ -354,43 +345,25 @@ app.post("/gmail/sync", async (req, res) => {
 
         const fromEmail = from.match(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/)?.[0]?.toLowerCase();
         const toEmail = to.match(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/)?.[0]?.toLowerCase();
-
-        const contactId = contactEmails[fromEmail] || contactEmails[toEmail];
+        const contactId = contactEmailMap[fromEmail] || contactEmailMap[toEmail];
         if (!contactId) continue;
 
-        const direction = contactEmails[fromEmail] ? "received" : "sent";
+        const direction = contactEmailMap[fromEmail] ? "received" : "sent";
         const dateStr = date ? new Date(date).toISOString().slice(0, 10) : new Date().toISOString().slice(0, 10);
 
-        results.push({
-          gmailId: msg.id,
-          contactId,
-          subject,
-          body: "",
-          date: dateStr,
-          direction,
-          status: "read",
-          autoSynced: true,
-          gmailAccount: accountEmail || "",
-        });
-        synced++;
+        results.push({ gmailId: msg.id, contactId, subject, body: "", date: dateStr, direction, status: "read", autoSynced: "true", gmailAccount: accountEmail || "" });
       }
     }
 
-    // Save to Firebase in batches
-    const BASE_FS = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents`;
     for (const email of results) {
-      await fetch(`${BASE_FS}/emails?key=${API_KEY}`, {
+      await fetch(`${BASE}/emails?key=${API_KEY}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          fields: Object.fromEntries(
-            Object.entries(email).map(([k, v]) => [k, { stringValue: String(v) }])
-          )
-        })
+        body: JSON.stringify({ fields: Object.fromEntries(Object.entries(email).map(([k, v]) => [k, { stringValue: String(v) }])) })
       });
     }
 
-    res.json({ synced, total: results.length });
+    res.json({ synced: results.length });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -401,67 +374,38 @@ app.post("/ai/pitchdeck-match", async (req, res) => {
     const { deckText, deckName, base64, fileType } = req.body;
     if (!deckText && !base64) return res.status(400).json({ error: "deckText or base64 required" });
 
-    // Build message content — use document API for PDFs, text for others
-    let extractContent;
-    if (base64 && fileType === "pdf") {
-      extractContent = [
-        {
-          type: "document",
-          source: { type: "base64", media_type: "application/pdf", data: base64 }
-        },
-        {
-          type: "text",
-          text: `Extract the key investment details from this pitch deck. Return ONLY a JSON object:
-{
-  "companyName": "",
-  "assetClass": "",
-  "strategy": "",
-  "geography": "",
-  "dealSize": "",
-  "returnTarget": "",
-  "sector": "",
-  "summary": ""
-}`
-        }
-      ];
-    } else {
-      extractContent = `Extract the key investment details from this pitch deck. Return ONLY a JSON object:
-{
-  "companyName": "",
-  "assetClass": "",
-  "strategy": "",
-  "geography": "",
-  "dealSize": "",
-  "returnTarget": "",
-  "sector": "",
-  "summary": ""
-}
+    console.log(`Pitchdeck match: ${deckName}, fileType: ${fileType}, hasBase64: ${!!base64}`);
 
-Pitch deck content:
-${(deckText || "").slice(0, 8000)}`;
+    let extractMessages;
+    if (base64 && fileType === "pdf") {
+      extractMessages = [{
+        role: "user",
+        content: [
+          { type: "document", source: { type: "base64", media_type: "application/pdf", data: base64 } },
+          { type: "text", text: "Extract the key investment details from this pitch deck. Return ONLY a JSON object with no extra text:\n{\"companyName\":\"\",\"assetClass\":\"\",\"strategy\":\"\",\"geography\":\"\",\"dealSize\":\"\",\"returnTarget\":\"\",\"sector\":\"\",\"summary\":\"\"}" }
+        ]
+      }];
+    } else {
+      extractMessages = [{
+        role: "user",
+        content: `Extract the key investment details from this pitch deck named "${deckName}". Return ONLY a JSON object with no extra text:\n{"companyName":"","assetClass":"","strategy":"","geography":"","dealSize":"","returnTarget":"","sector":"","summary":""}\n\nContent: ${(deckText || "").slice(0, 6000)}`
+      }];
     }
 
-    // Step 1: Extract deal details
-    const extractRes = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: "claude-sonnet-4-20250514",
-        max_tokens: 1000,
-        messages: [{ role: "user", content: extractContent }]
-      })
-    });
-    const extractData = await extractRes.json();
-    console.log("Extract response:", JSON.stringify(extractData).slice(0, 300));
-    const extractText = extractData.content?.[0]?.text || "{}";
+    const extractData = await callClaude(extractMessages, 800);
+    console.log("Extract response:", JSON.stringify(extractData?.content?.[0]?.text || "").slice(0, 200));
+
     let dealDetails = {};
-try {
-  const cleaned = extractText.replace(/```json|```/g, "").trim();
-  const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
-  if (jsonMatch) dealDetails = JSON.parse(jsonMatch[0]);
-} catch(e) { console.error("Extract parse error:", e.message, extractText.slice(0, 200)); }
-    // Step 2: Match against CRM contacts
-    const contactSample = cache.contacts.slice(0, 8000).map(c => ({
+    try {
+      const extractText = extractData.content?.[0]?.text || "{}";
+      const jsonMatch = extractText.match(/\{[\s\S]*\}/);
+      if (jsonMatch) dealDetails = JSON.parse(jsonMatch[0]);
+    } catch (e) {
+      console.error("Extract parse error:", e.message);
+      dealDetails = { companyName: deckName, summary: "Could not parse deck details" };
+    }
+
+    const contactSample = cache.contacts.slice(0, 5000).map(c => ({
       id: c.id,
       name: c.name || `${c.firstName || ""} ${c.lastName || ""}`.trim(),
       company: c.company || "",
@@ -469,42 +413,60 @@ try {
       industry: c.industry || "",
       importGroups: c.importGroups || "",
       metroArea: c.metroArea || "",
-      email: c.email || "",
     }));
 
-    const matchRes = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: "claude-sonnet-4-20250514",
-        max_tokens: 3000,
-        messages: [{
-          role: "user",
-          content: `You are a capital markets expert. Based on this deal, find the best matching investors from the CRM.
+    const matchData = await callClaude([{
+      role: "user",
+      content: `You are a capital markets expert. Find the best investor matches for this deal.\n\nDeal: ${JSON.stringify(dealDetails)}\n\nReturn the top 30 best matching contacts as a JSON array. No extra text:\n[{"id":"contact_id","name":"name","company":"company","reason":"one sentence why","score":95,"group":"PE Investor"}]\n\nValid groups: PE Investor, Family Office, Pension Fund, Endowment, Sovereign Wealth, Fund of Funds, Real Estate, Infrastructure, Credit, Other\n\nCRM contacts (${contactSample.length} total):\n${JSON.stringify(contactSample)}`
+    }], 3000);
 
-Deal: ${JSON.stringify(dealDetails)}
+    let matches = [];
+    try {
+      const matchText = matchData.content?.[0]?.text || "[]";
+      const jsonMatch = matchText.match(/\[[\s\S]*\]/);
+      if (jsonMatch) matches = JSON.parse(jsonMatch[0]);
+    } catch (e) {
+      console.error("Match parse error:", e.message);
+    }
 
-Find the top 30 best matching contacts. Return ONLY a JSON array:
-[{
-  "id": "contact_id",
-  "name": "name",
-  "company": "company",
-  "reason": "why they match",
-  "score": 95,
-  "group": "PE Investor"
-}]
+    let webMatches = [];
+    try {
+      const webData = await callClaude([{
+        role: "user",
+        content: `Search for institutional investors who invest in ${dealDetails.assetClass || ""} ${dealDetails.strategy || ""} ${dealDetails.sector || ""} deals of around ${dealDetails.dealSize || "various sizes"} in ${dealDetails.geography || "global"} markets. Return a JSON array of 5 specific investors not in a private CRM:\n[{"name":"person","company":"firm","reason":"why they match","score":75,"group":"type","inCRM":false}]\nReturn ONLY the JSON array.`
+      }], 1000, [{ type: "web_search_20250305", name: "web_search" }]);
 
-Groups: PE Investor, Family Office, Pension Fund, Endowment, Sovereign Wealth, Fund of Funds, Real Estate, Infrastructure, Credit, Other
+      const webText = (webData.content || []).filter(b => b.type === "text").map(b => b.text).join("");
+      const jsonMatch = webText.match(/\[[\s\S]*\]/);
+      if (jsonMatch) webMatches = JSON.parse(jsonMatch[0]);
+      webMatches = webMatches.map(m => ({ ...m, inCRM: false }));
+    } catch (e) {
+      console.error("Web search error:", e.message);
+    }
 
-CRM contacts (${contactSample.length}):
-${JSON.stringify(contactSample)}
-
-Return ONLY the JSON array.`
-        }]
-      })
+    const allMatches = [...matches.map(m => ({ ...m, inCRM: true })), ...webMatches].sort((a, b) => (b.score || 0) - (a.score || 0));
+    const grouped = {};
+    allMatches.forEach(m => {
+      const g = m.group || "Other";
+      if (!grouped[g]) grouped[g] = [];
+      grouped[g].push(m);
     });
-    const matchData = await matchRes.json();
-    const matchText = matchData.content?.[0]?.text || "[]";
+
+    console.log(`Pitchdeck match complete: ${matches.length} CRM, ${webMatches.length} web`);
+    res.json({ dealDetails, matches: allMatches, grouped, totalCRM: matches.length, totalWeb: webMatches.length, deckName: deckName || "Uploaded Deck" });
+  } catch (e) {
+    console.error("Pitchdeck error:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/cache/refresh", (req, res) => {
+  buildCache();
+  res.json({ message: "Cache refresh started" });
+});
+
+const PORT = process.env.PORT || 3001;
+app.listen(PORT, () => console.log(`CRM backend v3.1 running on port ${PORT}`));
     let matches = [];
 try {
   const cleaned = matchText.replace(/```json|```/g, "").trim();
