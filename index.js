@@ -393,15 +393,12 @@ app.post("/ai/pitchdeck-match", async (req, res) => {
     }
 
     const extractData = await callClaude(extractMessages, 800);
-    console.log("Extract response:", JSON.stringify(extractData?.content?.[0]?.text || "").slice(0, 200));
-
     let dealDetails = {};
     try {
       const extractText = extractData.content?.[0]?.text || "{}";
       const jsonMatch = extractText.match(/\{[\s\S]*\}/);
       if (jsonMatch) dealDetails = JSON.parse(jsonMatch[0]);
     } catch (e) {
-      console.error("Extract parse error:", e.message);
       dealDetails = { companyName: deckName, summary: "Could not parse deck details" };
     }
 
@@ -425,9 +422,7 @@ app.post("/ai/pitchdeck-match", async (req, res) => {
       const matchText = matchData.content?.[0]?.text || "[]";
       const jsonMatch = matchText.match(/\[[\s\S]*\]/);
       if (jsonMatch) matches = JSON.parse(jsonMatch[0]);
-    } catch (e) {
-      console.error("Match parse error:", e.message);
-    }
+    } catch (e) {}
 
     let webMatches = [];
     try {
@@ -440,9 +435,7 @@ app.post("/ai/pitchdeck-match", async (req, res) => {
       const jsonMatch = webText.match(/\[[\s\S]*\]/);
       if (jsonMatch) webMatches = JSON.parse(jsonMatch[0]);
       webMatches = webMatches.map(m => ({ ...m, inCRM: false }));
-    } catch (e) {
-      console.error("Web search error:", e.message);
-    }
+    } catch (e) {}
 
     const allMatches = [...matches.map(m => ({ ...m, inCRM: true })), ...webMatches].sort((a, b) => (b.score || 0) - (a.score || 0));
     const grouped = {};
@@ -452,7 +445,6 @@ app.post("/ai/pitchdeck-match", async (req, res) => {
       grouped[g].push(m);
     });
 
-    console.log(`Pitchdeck match complete: ${matches.length} CRM, ${webMatches.length} web`);
     res.json({ dealDetails, matches: allMatches, grouped, totalCRM: matches.length, totalWeb: webMatches.length, deckName: deckName || "Uploaded Deck" });
   } catch (e) {
     console.error("Pitchdeck error:", e.message);
@@ -467,69 +459,3 @@ app.post("/cache/refresh", (req, res) => {
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => console.log(`CRM backend v3.1 running on port ${PORT}`));
-    let matches = [];
-try {
-  const cleaned = matchText.replace(/```json|```/g, "").trim();
-  const jsonMatch = cleaned.match(/\[[\s\S]*\]/);
-  if (jsonMatch) matches = JSON.parse(jsonMatch[0]);
-} catch(e) { console.error("Match parse error:", e.message, matchText.slice(0, 200)); }
-    // Step 3: Web search for additional investors
-    const webRes = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: "claude-sonnet-4-20250514",
-        max_tokens: 1000,
-        tools: [{ type: "web_search_20250305", name: "web_search" }],
-        messages: [{
-          role: "user",
-          content: `Search for institutional investors who invest in ${dealDetails.assetClass} ${dealDetails.strategy} ${dealDetails.sector} deals of size ${dealDetails.dealSize} in ${dealDetails.geography}.
-
-Return ONLY a JSON array of 5-10 investors not already in a private CRM:
-[{
-  "name": "person name",
-  "company": "firm",
-  "reason": "why they match",
-  "score": 75,
-  "group": "investor type",
-  "inCRM": false
-}]`
-        }]
-      })
-    });
-    const webData = await webRes.json();
-    const webText = (webData.content || []).filter(b => b.type === "text").map(b => b.text).join("");
-    let webMatches = [];
-    try {
-      const jsonMatch = webText.match(/\[[\s\S]*\]/);
-      if (jsonMatch) webMatches = JSON.parse(jsonMatch[0]);
-    } catch {}
-    webMatches = webMatches.map(m => ({ ...m, inCRM: false }));
-
-    const allMatches = [
-      ...matches.map(m => ({ ...m, inCRM: true })),
-      ...webMatches
-    ].sort((a, b) => (b.score || 0) - (a.score || 0));
-
-    const grouped = {};
-    allMatches.forEach(m => {
-      const g = m.group || "Other";
-      if (!grouped[g]) grouped[g] = [];
-      grouped[g].push(m);
-    });
-
-    res.json({
-      dealDetails,
-      matches: allMatches,
-      grouped,
-      totalCRM: matches.length,
-      totalWeb: webMatches.length,
-      deckName: deckName || "Uploaded Deck",
-    });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => console.log(`CRM backend v3.0 running on port ${PORT}`));
