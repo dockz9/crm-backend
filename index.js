@@ -54,8 +54,7 @@ async function callClaude(messages, maxTokens = 2000, tools = null) {
   if (tools) body.tools = tools;
   const res = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body)
+headers: { "Content-Type": "application/json", "x-api-key": process.env.ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" },    body: JSON.stringify(body)
   });
   return res.json();
 }
