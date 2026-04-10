@@ -357,7 +357,7 @@ app.post("/gmail/sync", async (req, res) => {
     for (const email of results) {
       await fetch(`${BASE}/emails?key=${API_KEY}`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", "x-api-key": process.env.ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" },        
         body: JSON.stringify({ fields: Object.fromEntries(Object.entries(email).map(([k, v]) => [k, { stringValue: String(v) }])) })
       });
     }
