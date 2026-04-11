@@ -323,19 +323,21 @@ app.post("/gmail/sync", async (req, res) => {
     });
 
     const results = [];
-    const contactEmails = cache.contacts.filter(c => c.email).slice(0, 100);
-    const emailQuery = contactEmails.map(c => `from:${c.email} OR to:${c.email}`).join(" OR ");
+    const syncedIds = new Set();
 
-    for (const folder of ["", "in:sent"]) {
-      const q = folder ? `${folder} ${emailQuery}` : emailQuery;
+    // Pull recent emails from inbox and sent — no contact filter
+    for (const folder of ["in:inbox", "in:sent"]) {
       const listRes = await fetch(
-        `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${encodeURIComponent(q)}&maxResults=100`,
+        `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${encodeURIComponent(folder)}&maxResults=200`,
         { headers: { Authorization: `Bearer ${token}` } }
       );
       if (listRes.status === 401) return res.status(401).json({ error: "Gmail token expired" });
       const listData = await listRes.json();
 
       for (const msg of (listData.messages || [])) {
+        if (syncedIds.has(msg.id)) continue;
+        syncedIds.add(msg.id);
+
         const detailRes = await fetch(
           `https://gmail.googleapis.com/gmail/v1/users/me/messages/${msg.id}?format=metadata&metadataHeaders=From&metadataHeaders=To&metadataHeaders=Subject&metadataHeaders=Date`,
           { headers: { Authorization: `Bearer ${token}` } }
@@ -348,26 +350,41 @@ app.post("/gmail/sync", async (req, res) => {
         const date = headers.find(h => h.name === "Date")?.value || "";
 
         const fromEmail = from.match(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/)?.[0]?.toLowerCase();
-        const toEmail = to.match(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/)?.[0]?.toLowerCase();
-        const contactId = contactEmailMap[fromEmail] || contactEmailMap[toEmail];
+        const toEmails = to.match(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g)?.map(e => e.toLowerCase()) || [];
+
+        // Check from email against all contacts
+        let contactId = contactEmailMap[fromEmail];
+        let direction = "received";
+
+        // Check all to emails
+        if (!contactId) {
+          for (const toEmail of toEmails) {
+            if (contactEmailMap[toEmail]) {
+              contactId = contactEmailMap[toEmail];
+              direction = "sent";
+              break;
+            }
+          }
+        }
+
         if (!contactId) continue;
 
-        const direction = contactEmailMap[fromEmail] ? "received" : "sent";
         const dateStr = date ? new Date(date).toISOString().slice(0, 10) : new Date().toISOString().slice(0, 10);
-
         results.push({ gmailId: msg.id, contactId, subject, body: "", date: dateStr, direction, status: "read", autoSynced: "true", gmailAccount: accountEmail || "" });
       }
     }
 
+    // Save to Firebase
     for (const email of results) {
       await fetch(`${BASE}/emails?key=${API_KEY}`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", "x-api-key": process.env.ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" },        
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ fields: Object.fromEntries(Object.entries(email).map(([k, v]) => [k, { stringValue: String(v) }])) })
       });
     }
 
-    res.json({ synced: results.length });
+    console.log(`Gmail sync: ${results.length} emails matched from ${syncedIds.size} checked`);
+    res.json({ synced: results.length, checked: syncedIds.size });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
