@@ -155,7 +155,7 @@ setInterval(buildCache, CACHE_REFRESH_MS);
 app.get("/", (req, res) => {
   res.json({
     status: "Win This Moment! CRM backend is running",
-    version: "3.1",
+    version: "3.2",
     cache: {
       contacts: cache.contacts.length,
       companies: cache.companies.length,
@@ -291,7 +291,7 @@ app.get("/dashboard/stats", async (req, res) => {
       const contact = cache.contacts.find(c => c.id === sent.contactId);
       followUps.push({
         contactId: sent.contactId,
-        contactName: contact ? (contact.name || `${contact.firstName || ""} ${contact.lastName || ""}`.trim()) : "Unknown",
+        contactName: contact ? (contact.name || `${contact.firstName || ""} ${contact.lastName || ""}`.trim()) : (sent.contactName || "Unknown"),
         subject: sent.subject,
         daysSince,
         emailId: sent.id,
@@ -325,7 +325,6 @@ app.post("/gmail/sync", async (req, res) => {
     const results = [];
     const syncedIds = new Set();
 
-    // Pull recent emails from inbox and sent — no contact filter
     for (const folder of ["in:inbox", "in:sent"]) {
       const listRes = await fetch(
         `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${encodeURIComponent(folder)}&maxResults=200`,
@@ -352,11 +351,9 @@ app.post("/gmail/sync", async (req, res) => {
         const fromEmail = from.match(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/)?.[0]?.toLowerCase();
         const toEmails = to.match(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g)?.map(e => e.toLowerCase()) || [];
 
-        // Check from email against all contacts
         let contactId = contactEmailMap[fromEmail];
         let direction = "received";
 
-        // Check all to emails
         if (!contactId) {
           for (const toEmail of toEmails) {
             if (contactEmailMap[toEmail]) {
@@ -369,12 +366,14 @@ app.post("/gmail/sync", async (req, res) => {
 
         if (!contactId) continue;
 
+        const contact = cache.contacts.find(c => c.id === contactId);
+        const contactName = contact ? (contact.name || `${contact.firstName || ""} ${contact.lastName || ""}`.trim()) : "";
         const dateStr = date ? new Date(date).toISOString().slice(0, 10) : new Date().toISOString().slice(0, 10);
-        results.push({ gmailId: msg.id, contactId, subject, body: "", date: dateStr, direction, status: "read", autoSynced: "true", gmailAccount: accountEmail || "" });
+
+        results.push({ gmailId: msg.id, contactId, contactName, subject, body: "", date: dateStr, direction, status: "read", autoSynced: "true", gmailAccount: accountEmail || "" });
       }
     }
 
-    // Save to Firebase
     for (const email of results) {
       await fetch(`${BASE}/emails?key=${API_KEY}`, {
         method: "POST",
@@ -423,7 +422,7 @@ app.post("/ai/pitchdeck-match", async (req, res) => {
       dealDetails = { companyName: deckName, summary: "Could not parse deck details" };
     }
 
-    const contactSample = cache.contacts.slice(0, 5000).map(c => ({
+    const contactSample = cache.contacts.slice(0, 2000).map(c => ({
       id: c.id,
       name: c.name || `${c.firstName || ""} ${c.lastName || ""}`.trim(),
       company: c.company || "",
@@ -466,6 +465,7 @@ app.post("/ai/pitchdeck-match", async (req, res) => {
       grouped[g].push(m);
     });
 
+    console.log(`Pitchdeck match complete: ${matches.length} CRM, ${webMatches.length} web`);
     res.json({ dealDetails, matches: allMatches, grouped, totalCRM: matches.length, totalWeb: webMatches.length, deckName: deckName || "Uploaded Deck" });
   } catch (e) {
     console.error("Pitchdeck error:", e.message);
@@ -479,4 +479,4 @@ app.post("/cache/refresh", (req, res) => {
 });
 
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => console.log(`CRM backend v3.1 running on port ${PORT}`));
+app.listen(PORT, () => console.log(`CRM backend v3.2 running on port ${PORT}`));
